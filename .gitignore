@@ -1,0 +1,11 @@
+trash/*
+
+res/
+res_simple/*
+res_fused/*
+
+spmv/*
+poisson_cg/profile_cpu/*
+poisson_cg/profile_cuda/*
+
+*.json
