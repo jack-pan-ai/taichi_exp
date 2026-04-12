@@ -1,11 +1,13 @@
 #! /bin/bash
-set -euo pipefail
 
-export OMP_NUM_THREADS=32
-export OMP_PLACES="{0:32}"
+export THREADS=20
+export INTEROP_THREADS=1
+export OMP_NUM_THREADS=20
+export OMP_PLACES="{0:20}"
 export OMP_PROC_BIND=close
 export OMP_DISPLAY_ENV=verbose
 export OMP_DISPLAY_AFFINITY=TRUE
+
 N_CPU=(1000 2000 3000 4000 5000)
 N_GPU=(1000 2000 3000 4000 5000)
 

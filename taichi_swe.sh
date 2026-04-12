@@ -1,8 +1,8 @@
 #! /bin/bash
 set -euo pipefail
 
-export OMP_NUM_THREADS=32
-export OMP_PLACES="{0:32}"
+export THREADS=20
+export OMP_PLACES="{0:20}"
 export OMP_PROC_BIND=close
 export OMP_DISPLAY_ENV=verbose
 export OMP_DISPLAY_AFFINITY=TRUE
@@ -21,7 +21,7 @@ do
     # Simple (non-fused)
     python "${SCRIPT_SIMPLE}" \
         --arch=cpu \
-        --threads "${THREADS}" --interop-threads "${INTEROP_THREADS}" \
+        --threads "${THREADS}" --interop-threads 1 \
         --profile --dt "${delta_t}" --profile-warmup 5 --profile-iters 20 \
         --output "${ROOT_DIR}/res_simple" \
         "/home/x_panq/.easier/triangular_${n}.hdf5" \
@@ -30,7 +30,7 @@ do
     # Fused / optimized
     python "${SCRIPT_FUSED}" \
         --arch=cpu \
-        --threads "${THREADS}" --interop-threads "${INTEROP_THREADS}" \
+        --threads "${THREADS}" --interop-threads 1 \
         --profile --dt "${delta_t}" --profile-warmup 0 --profile-iters 20 \
         --output "${ROOT_DIR}/res_fused" \
         "/home/x_panq/.easier/triangular_${n}.hdf5" \
@@ -43,7 +43,7 @@ do
 
     python "${SCRIPT_SIMPLE}" \
         --arch=cuda \
-        --threads "${THREADS}" --interop-threads "${INTEROP_THREADS}" \
+        --threads "${THREADS}" --interop-threads 1 \
         --profile --dt "${delta_t}" --profile-warmup 50 --profile-iters 100 \
         --output "${ROOT_DIR}/res_simple" \
         "/home/x_panq/.easier/triangular_${n}.hdf5" \
@@ -51,7 +51,7 @@ do
 
     python "${SCRIPT_FUSED}" \
         --arch=cuda \
-        --threads "${THREADS}" --interop-threads "${INTEROP_THREADS}" \
+        --threads "${THREADS}" --interop-threads 1 \
         --profile --dt "${delta_t}" --profile-warmup 50 --profile-iters 100 \
         --output "${ROOT_DIR}/res_fused" \
         "/home/x_panq/.easier/triangular_${n}.hdf5" \

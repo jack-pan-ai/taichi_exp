@@ -463,7 +463,7 @@ def main() -> None:
     t1 = time.perf_counter()
     # export profiling info
     # ti.profiler.print_scoped_profiler_info()
-    ti.profiler.print_kernel_profiler_info('trace')         # prints timing summary to console
+    # ti.profiler.print_kernel_profiler_info('trace')         # prints timing summary to console
 
     seconds = t1 - t0
     ms_per_iter = seconds / profile_iters * 1000.0
