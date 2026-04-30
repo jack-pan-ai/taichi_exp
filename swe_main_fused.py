@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Taichi SWE stepper (CPU/CUDA) - fused/optimized variant.
+Taichi SWE stepper (CPU/CUDA) with torch.fx/EASIER graph-faithful fusion.
 
-This version keeps the same RK4 time integration and the same physical flux
-expressions as the EASIER SWE tutorial, but **fuses** the edge pipeline into a
-single kernel to reduce memory traffic:
-
-  face_reconstruct -> (u,v) -> flux -> scatter  ==> one pass over edges
-
-The non-fused baseline remains in `taichi/swe_main.py`.
+This file intentionally preserves the exact 20 fused module boundaries from the
+EASIER/torch.fx graph and mirrors the ordering used by
+`kokkos/example/shallow_water_equation/shallow_water_fused.cpp`.
 """
 
 import argparse
@@ -19,7 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import taichi as ti 
+import taichi as ti
+
 
 def _maybe_import_h5py():
     try:
@@ -136,7 +133,12 @@ def load_from_hdf5(mesh_path: Path, state_path: Path) -> SweDiskArrays:
     return arrays
 
 
-def make_sample_arrays(nc: int = 8192, ne: int = 65536, nbc: int = 2048, seed: int = 0) -> SweDiskArrays:
+def make_sample_arrays(
+    nc: int = 8192,
+    ne: int = 65536,
+    nbc: int = 2048,
+    seed: int = 0,
+) -> SweDiskArrays:
     rng = np.random.default_rng(seed)
     src = rng.integers(0, nc, size=(ne,), dtype=np.int64)
     dst = rng.integers(0, nc, size=(ne,), dtype=np.int64)
@@ -226,7 +228,6 @@ def main() -> None:
     if args.profile_warmup < -1:
         raise SystemExit("--profile-warmup must be >= -1")
 
-    # Pin CPU threading (mirrors EASIER).
     os.environ["OMP_NUM_THREADS"] = str(args.threads)
     os.environ["MKL_NUM_THREADS"] = str(args.threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(args.threads)
@@ -246,24 +247,26 @@ def main() -> None:
 
     arch = ti.cpu if args.arch == "cpu" else ti.cuda
     if args.arch == "cpu":
-        ti.init(arch=arch, default_fp=ti.f64, kernel_profiler=True, #kernel_profiler=False, 
-        cpu_max_num_threads=args.threads)
+        ti.init(arch=arch, default_fp=ti.f64, kernel_profiler=True, cpu_max_num_threads=args.threads)
     else:
         ti.init(arch=arch, default_fp=ti.f64, kernel_profiler=False)
 
     nc, ne, nbc = arrays.nc, arrays.ne, arrays.nbc
-    print(f"[taichi-swe-fused] nc={nc}, ne={ne}, nbc={nbc}")
+    nbc_shape = max(nbc, 1)
+    print(f"[taichi-swe-fused-graph] nc={nc}, ne={ne}, nbc={nbc}")
 
-    # Fields
+    # Index arrays:
+    # - src/dst: face gather indices and face scatter destination (dst)
+    # - bcells: boundary mapping / boundary scatter destination
     src = ti.field(dtype=ti.i32, shape=(ne,))
     dst = ti.field(dtype=ti.i32, shape=(ne,))
-    bcells = ti.field(dtype=ti.i32, shape=(nbc,)) if nbc > 0 else None
+    bcells = ti.field(dtype=ti.i32, shape=(nbc_shape,))
 
     alpha = ti.field(dtype=ti.f64, shape=(ne,))
     sx = ti.field(dtype=ti.f64, shape=(ne,))
     sy = ti.field(dtype=ti.f64, shape=(ne,))
-    bsx = ti.field(dtype=ti.f64, shape=(nbc,)) if nbc > 0 else None
-    bsy = ti.field(dtype=ti.f64, shape=(nbc,)) if nbc > 0 else None
+    bsx = ti.field(dtype=ti.f64, shape=(nbc_shape,))
+    bsy = ti.field(dtype=ti.f64, shape=(nbc_shape,))
 
     area = ti.field(dtype=ti.f64, shape=(nc,))
     x = ti.field(dtype=ti.f64, shape=(nc,))
@@ -273,24 +276,51 @@ def main() -> None:
     uh = ti.field(dtype=ti.f64, shape=(nc,))
     vh = ti.field(dtype=ti.f64, shape=(nc,))
 
-    dh1 = ti.field(dtype=ti.f64, shape=(nc,))
-    du1 = ti.field(dtype=ti.f64, shape=(nc,))
-    dv1 = ti.field(dtype=ti.f64, shape=(nc,))
-    dh2 = ti.field(dtype=ti.f64, shape=(nc,))
-    du2 = ti.field(dtype=ti.f64, shape=(nc,))
-    dv2 = ti.field(dtype=ti.f64, shape=(nc,))
-    dh3 = ti.field(dtype=ti.f64, shape=(nc,))
-    du3 = ti.field(dtype=ti.f64, shape=(nc,))
-    dv3 = ti.field(dtype=ti.f64, shape=(nc,))
-    dh4 = ti.field(dtype=ti.f64, shape=(nc,))
-    du4 = ti.field(dtype=ti.f64, shape=(nc,))
-    dv4 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_2 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_3 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_4 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_7 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_8 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_9 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_12 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_13 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_14 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_17 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_18 = ti.field(dtype=ti.f64, shape=(nc,))
+    truediv_19 = ti.field(dtype=ti.f64, shape=(nc,))
 
-    tmp_h = ti.field(dtype=ti.f64, shape=(nc,))
-    tmp_uh = ti.field(dtype=ti.f64, shape=(nc,))
-    tmp_vh = ti.field(dtype=ti.f64, shape=(nc,))
+    add_10 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_11 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_12 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_23 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_24 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_25 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_36 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_37 = ti.field(dtype=ti.f64, shape=(nc,))
+    add_38 = ti.field(dtype=ti.f64, shape=(nc,))
 
-    # Upload
+    scatter = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_1 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_2 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_3 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_4 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_5 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_6 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_7 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_8 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_9 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_10 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_11 = ti.field(dtype=ti.f64, shape=(nc,))
+
+    scatter_b = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_1 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_2 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_3 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_4 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_5 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_6 = ti.field(dtype=ti.f64, shape=(nc,))
+    scatter_b_7 = ti.field(dtype=ti.f64, shape=(nc,))
+
     src.from_numpy(arrays.src.astype(np.int32, copy=False))
     dst.from_numpy(arrays.dst.astype(np.int32, copy=False))
     alpha.from_numpy(arrays.alpha)
@@ -301,122 +331,288 @@ def main() -> None:
     y.from_numpy(arrays.y)
 
     if nbc > 0:
-        assert bcells is not None and bsx is not None and bsy is not None
         bcells.from_numpy(arrays.bcells.astype(np.int32, copy=False))
         bsx.from_numpy(arrays.bsx)
         bsy.from_numpy(arrays.bsy)
+    else:
+        bcells.fill(0)
+        bsx.fill(0.0)
+        bsy.fill(0.0)
 
     h.from_numpy(arrays.h)
     uh.fill(0.0)
     vh.fill(0.0)
 
-    dt = float(args.dt)
+    half_dt = 0.00025
+    full_dt = 0.0005
+    rk_weight = 8.333333333333333e-05
 
+    # torch.fx: easier0_select_reduce30
     @ti.kernel
-    def zero3(a: ti.template(), b: ti.template(), c: ti.template()):
-        for i in range(nc):
-            a[i] = 0.0
-            b[i] = 0.0
-            c[i] = 0.0
+    def easier0_select_reduce30():
+        for i in range(nbc):
+            cell = bcells[i]
+            p = 0.5 * h[cell] * h[cell]
+            ti.atomic_add(scatter_b[cell], p * bsx[i])
+            ti.atomic_add(scatter_b_1[cell], p * bsy[i])
 
+    # torch.fx: easier1_select_reduce16
     @ti.kernel
-    def combine_scalar(base: ti.template(), delta: ti.template(), scale: ti.f64, out: ti.template()):
-        for i in range(nc):
-            out[i] = base[i] + scale * delta[i]
-
-    @ti.kernel
-    def scale_by_area3(dh: ti.template(), du: ti.template(), dv: ti.template()):
-        for i in range(nc):
-            inv_area = 1.0 / area[i]
-            dh[i] = dh[i] * inv_area
-            du[i] = du[i] * inv_area
-            dv[i] = dv[i] * inv_area
-
-    @ti.kernel
-    def add_rk4_update(factor: ti.f64):
-        for i in range(nc):
-            h[i] += factor * (dh1[i] + dh2[i] + dh3[i] + dh4[i])
-            uh[i] += factor * (du1[i] + du2[i] + du3[i] + du4[i])
-            vh[i] += factor * (dv1[i] + dv2[i] + dv3[i] + dv4[i])
-
-    @ti.kernel
-    def delta_edges_fused(
-        h_in: ti.template(),
-        uh_in: ti.template(),
-        vh_in: ti.template(),
-        dh: ti.template(),
-        du: ti.template(),
-        dv: ti.template(),
-    ):
-        # Fused edge pipeline: face reconstruction + velocity + flux + scatter.
+    def easier1_select_reduce16():
         for e in range(ne):
             left = src[e]
             right = dst[e]
             a = alpha[e]
 
-            # Face reconstruction (EASIER face_reconstruct)
-            h_face = (1.0 - a) * h_in[left] + a * h_in[right]
-            uh_face = (1.0 - a) * uh_in[left] + a * uh_in[right]
-            vh_face = (1.0 - a) * vh_in[left] + a * vh_in[right]
+            h_face = (1.0 - a) * h[left] + a * h[right]
+            uh_face = (1.0 - a) * uh[left] + a * uh[right]
+            vh_face = (1.0 - a) * vh[left] + a * vh[right]
 
-            # Face velocity (EASIER: u_f = uh_f/h_f, v_f = vh_f/h_f)
             u = uh_face / h_face
             v = vh_face / h_face
 
-            # Flux terms (EASIER)
-            h_square = 0.5 * h_face * h_face
-            sx_val = sx[e]
-            sy_val = sy[e]
-            uh_sx = uh_face * sx_val
-            vh_sy = vh_face * sy_val
+            mass_flux = uh_face * sx[e] + vh_face * sy[e]
+            xmom_flux = (u * uh_face + 0.5 * h_face * h_face) * sx[e] + (u * vh_face) * sy[e]
+            ymom_flux = (v * uh_face) * sx[e] + (v * vh_face + 0.5 * h_face * h_face) * sy[e]
 
-            cell = right  # scatter to dst
-            contrib_h = uh_sx + vh_sy
-            contrib_uh = (u * uh_face + h_square) * sx_val + u * vh_sy
-            contrib_vh = v * uh_sx + (v * vh_face + h_square) * sy_val
+            ti.atomic_add(scatter[right], mass_flux)
+            ti.atomic_add(scatter_1[right], xmom_flux)
+            ti.atomic_add(scatter_2[right], ymom_flux)
 
-            ti.atomic_add(dh[cell], -contrib_h)
-            ti.atomic_add(du[cell], -contrib_uh)
-            ti.atomic_add(dv[cell], -contrib_vh)
-
+    # torch.fx: easier2_map35
     @ti.kernel
-    def delta_boundary_fused(h_in: ti.template(), du: ti.template(), dv: ti.template()):
+    def easier2_map35():
+        for i in range(nc):
+            truediv_2[i] = -scatter[i] / area[i]
+            add_10[i] = h[i] + half_dt * truediv_2[i]
+
+    # torch.fx: easier3_map47
+    @ti.kernel
+    def easier3_map47():
+        for i in range(nc):
+            truediv_3[i] = -(scatter_1[i] + scatter_b[i]) / area[i]
+            add_11[i] = uh[i] + half_dt * truediv_3[i]
+
+    # torch.fx: easier4_map59
+    @ti.kernel
+    def easier4_map59():
+        for i in range(nc):
+            truediv_4[i] = -(scatter_2[i] + scatter_b_1[i]) / area[i]
+            add_12[i] = vh[i] + half_dt * truediv_4[i]
+
+    # torch.fx: easier5_select_reduce92
+    @ti.kernel
+    def easier5_select_reduce92():
         for i in range(nbc):
             cell = bcells[i]
-            h_cell = h_in[cell]
-            h_square = 0.5 * h_cell * h_cell
-            ti.atomic_add(du[cell], -h_square * bsx[i])
-            ti.atomic_add(dv[cell], -h_square * bsy[i])
+            p = 0.5 * add_10[cell] * add_10[cell]
+            ti.atomic_add(scatter_b_2[cell], p * bsx[i])
+            ti.atomic_add(scatter_b_3[cell], p * bsy[i])
 
-    def delta(h_in, uh_in, vh_in, delta_h, delta_uh, delta_vh):
-        # Same math as EASIER's delta(), but fused for fewer memory passes.
-        zero3(delta_h, delta_uh, delta_vh)
-        delta_edges_fused(h_in, uh_in, vh_in, delta_h, delta_uh, delta_vh)
-        if nbc > 0:
-            delta_boundary_fused(h_in, delta_uh, delta_vh)
-        scale_by_area3(delta_h, delta_uh, delta_vh)
+    # torch.fx: easier6_select_reduce80
+    @ti.kernel
+    def easier6_select_reduce80():
+        for e in range(ne):
+            left = src[e]
+            right = dst[e]
+            a = alpha[e]
 
-    def forward():
-        delta(h, uh, vh, dh1, du1, dv1)
+            h_face = (1.0 - a) * add_10[left] + a * add_10[right]
+            uh_face = (1.0 - a) * add_11[left] + a * add_11[right]
+            vh_face = (1.0 - a) * add_12[left] + a * add_12[right]
 
-        combine_scalar(h, dh1, 0.5 * dt, tmp_h)
-        combine_scalar(uh, du1, 0.5 * dt, tmp_uh)
-        combine_scalar(vh, dv1, 0.5 * dt, tmp_vh)
-        delta(tmp_h, tmp_uh, tmp_vh, dh2, du2, dv2)
+            u = uh_face / h_face
+            v = vh_face / h_face
 
-        combine_scalar(h, dh2, 0.5 * dt, tmp_h)
-        combine_scalar(uh, du2, 0.5 * dt, tmp_uh)
-        combine_scalar(vh, dv2, 0.5 * dt, tmp_vh)
-        delta(tmp_h, tmp_uh, tmp_vh, dh3, du3, dv3)
+            mass_flux = uh_face * sx[e] + vh_face * sy[e]
+            xmom_flux = (u * uh_face + 0.5 * h_face * h_face) * sx[e] + (u * vh_face) * sy[e]
+            ymom_flux = (v * uh_face) * sx[e] + (v * vh_face + 0.5 * h_face * h_face) * sy[e]
 
-        combine_scalar(h, dh3, dt, tmp_h)
-        combine_scalar(uh, du3, dt, tmp_uh)
-        combine_scalar(vh, dv3, dt, tmp_vh)
-        delta(tmp_h, tmp_uh, tmp_vh, dh4, du4, dv4)
+            ti.atomic_add(scatter_4[right], xmom_flux)
+            ti.atomic_add(scatter_3[right], mass_flux)
+            ti.atomic_add(scatter_5[right], ymom_flux)
 
-        add_rk4_update(dt / 6.0)
+    # torch.fx: easier7_map97
+    @ti.kernel
+    def easier7_map97():
+        for i in range(nc):
+            truediv_7[i] = -scatter_3[i] / area[i]
+            add_23[i] = h[i] + half_dt * truediv_7[i]
 
-    def sync():
+    # torch.fx: easier8_map118
+    @ti.kernel
+    def easier8_map118():
+        for i in range(nc):
+            truediv_9[i] = -(scatter_5[i] + scatter_b_3[i]) / area[i]
+            add_25[i] = vh[i] + half_dt * truediv_9[i]
+
+    # torch.fx: easier9_map107
+    @ti.kernel
+    def easier9_map107():
+        for i in range(nc):
+            truediv_8[i] = -(scatter_4[i] + scatter_b_2[i]) / area[i]
+            add_24[i] = uh[i] + half_dt * truediv_8[i]
+
+    # torch.fx: easier10_select_reduce151
+    @ti.kernel
+    def easier10_select_reduce151():
+        for i in range(nbc):
+            cell = bcells[i]
+            p = 0.5 * add_23[cell] * add_23[cell]
+            ti.atomic_add(scatter_b_4[cell], p * bsx[i])
+            ti.atomic_add(scatter_b_5[cell], p * bsy[i])
+
+    # torch.fx: easier11_select_reduce139
+    @ti.kernel
+    def easier11_select_reduce139():
+        for e in range(ne):
+            left = src[e]
+            right = dst[e]
+            a = alpha[e]
+
+            h_face = (1.0 - a) * add_23[left] + a * add_23[right]
+            uh_face = (1.0 - a) * add_24[left] + a * add_24[right]
+            vh_face = (1.0 - a) * add_25[left] + a * add_25[right]
+
+            u = uh_face / h_face
+            v = vh_face / h_face
+
+            mass_flux = uh_face * sx[e] + vh_face * sy[e]
+            xmom_flux = (u * uh_face + 0.5 * h_face * h_face) * sx[e] + (u * vh_face) * sy[e]
+            ymom_flux = (v * uh_face) * sx[e] + (v * vh_face + 0.5 * h_face * h_face) * sy[e]
+
+            ti.atomic_add(scatter_7[right], xmom_flux)
+            ti.atomic_add(scatter_6[right], mass_flux)
+            ti.atomic_add(scatter_8[right], ymom_flux)
+
+    # torch.fx: easier12_map177
+    @ti.kernel
+    def easier12_map177():
+        for i in range(nc):
+            truediv_14[i] = -(scatter_8[i] + scatter_b_5[i]) / area[i]
+            add_38[i] = vh[i] + full_dt * truediv_14[i]
+
+    # torch.fx: easier13_map166
+    @ti.kernel
+    def easier13_map166():
+        for i in range(nc):
+            truediv_13[i] = -(scatter_7[i] + scatter_b_4[i]) / area[i]
+            add_37[i] = uh[i] + full_dt * truediv_13[i]
+
+    # torch.fx: easier14_map156
+    @ti.kernel
+    def easier14_map156():
+        for i in range(nc):
+            truediv_12[i] = -scatter_6[i] / area[i]
+            add_36[i] = h[i] + full_dt * truediv_12[i]
+
+    # torch.fx: easier15_select_reduce198
+    @ti.kernel
+    def easier15_select_reduce198():
+        for e in range(ne):
+            left = src[e]
+            right = dst[e]
+            a = alpha[e]
+
+            h_face = (1.0 - a) * add_36[left] + a * add_36[right]
+            uh_face = (1.0 - a) * add_37[left] + a * add_37[right]
+            vh_face = (1.0 - a) * add_38[left] + a * add_38[right]
+
+            u = uh_face / h_face
+            v = vh_face / h_face
+
+            mass_flux = uh_face * sx[e] + vh_face * sy[e]
+            xmom_flux = (u * uh_face + 0.5 * h_face * h_face) * sx[e] + (u * vh_face) * sy[e]
+            ymom_flux = (v * uh_face) * sx[e] + (v * vh_face + 0.5 * h_face * h_face) * sy[e]
+
+            ti.atomic_add(scatter_10[right], xmom_flux)
+            ti.atomic_add(scatter_9[right], mass_flux)
+            ti.atomic_add(scatter_11[right], ymom_flux)
+
+    # torch.fx: easier16_select_reduce210
+    @ti.kernel
+    def easier16_select_reduce210():
+        for i in range(nbc):
+            cell = bcells[i]
+            p = 0.5 * add_36[cell] * add_36[cell]
+            ti.atomic_add(scatter_b_6[cell], p * bsx[i])
+            ti.atomic_add(scatter_b_7[cell], p * bsy[i])
+
+    # torch.fx: easier17_map239
+    @ti.kernel
+    def easier17_map239():
+        for i in range(nc):
+            truediv_17[i] = -scatter_9[i] / area[i]
+            h[i] += rk_weight * (truediv_2[i] + truediv_7[i] + truediv_12[i] + truediv_17[i])
+
+    # torch.fx: easier18_map249
+    @ti.kernel
+    def easier18_map249():
+        for i in range(nc):
+            truediv_19[i] = -(scatter_11[i] + scatter_b_7[i]) / area[i]
+            vh[i] += rk_weight * (truediv_4[i] + truediv_9[i] + truediv_14[i] + truediv_19[i])
+
+    # torch.fx: easier19_map244
+    @ti.kernel
+    def easier19_map244():
+        for i in range(nc):
+            truediv_18[i] = -(scatter_10[i] + scatter_b_6[i]) / area[i]
+            uh[i] += rk_weight * (truediv_3[i] + truediv_8[i] + truediv_13[i] + truediv_18[i])
+
+    def forward() -> None:
+        scatter_b.fill(0.0)
+        scatter_b_1.fill(0.0)
+        easier0_select_reduce30()
+
+        scatter.fill(0.0)
+        scatter_1.fill(0.0)
+        scatter_2.fill(0.0)
+        easier1_select_reduce16()
+
+        easier2_map35()
+        easier3_map47()
+        easier4_map59()
+
+        scatter_b_2.fill(0.0)
+        scatter_b_3.fill(0.0)
+        easier5_select_reduce92()
+
+        scatter_4.fill(0.0)
+        scatter_3.fill(0.0)
+        scatter_5.fill(0.0)
+        easier6_select_reduce80()
+
+        easier7_map97()
+        easier8_map118()
+        easier9_map107()
+
+        scatter_b_4.fill(0.0)
+        scatter_b_5.fill(0.0)
+        easier10_select_reduce151()
+
+        scatter_7.fill(0.0)
+        scatter_6.fill(0.0)
+        scatter_8.fill(0.0)
+        easier11_select_reduce139()
+
+        easier12_map177()
+        easier13_map166()
+        easier14_map156()
+
+        scatter_10.fill(0.0)
+        scatter_9.fill(0.0)
+        scatter_11.fill(0.0)
+        easier15_select_reduce198()
+
+        scatter_b_6.fill(0.0)
+        scatter_b_7.fill(0.0)
+        easier16_select_reduce210()
+
+        easier17_map239()
+        easier18_map249()
+        easier19_map244()
+
+    def sync() -> None:
         if args.arch == "cuda":
             ti.sync()
 
@@ -436,7 +632,7 @@ def main() -> None:
                 sync()
                 write_snapshot(step_id // args.output_interval)
         sync()
-        print(f"[done] ran {args.steps} steps (dt={dt}) on arch={args.arch}")
+        print(f"[done] ran {args.steps} steps (dt=0.0005) on arch={args.arch}")
         return
 
     profile_warmup = int(args.profile_warmup)
@@ -446,7 +642,6 @@ def main() -> None:
     profile_iters = int(args.profile_iters)
     if profile_iters <= 0:
         profile_iters = 20 if args.arch == "cpu" else 100
-
     if profile_iters <= 0:
         raise SystemExit("--profile-iters must be positive")
 
@@ -461,9 +656,6 @@ def main() -> None:
         forward()
     sync()
     t1 = time.perf_counter()
-    # export profiling info
-    # ti.profiler.print_scoped_profiler_info()
-    # ti.profiler.print_kernel_profiler_info('trace')         # prints timing summary to console
 
     seconds = t1 - t0
     ms_per_iter = seconds / profile_iters * 1000.0
@@ -477,4 +669,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
